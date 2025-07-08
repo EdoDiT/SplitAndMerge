@@ -8,22 +8,24 @@ class QuadNode:
             x: int,
             y: int,
             size: int,
-            children:Optional[List['QuadNode']] = []
+            children: Optional[List['QuadNode']] = None
     ):
         self.x = x  # Top-left x coordinate
         self.y = y  # Top-left y coordinate
         self.size = size  # Size of the region
-        self.children = children
+        self.children = children if children is not None else []
 
     def is_leaf(self) -> bool:
         """Check if the node is a leaf node (has no children)."""
-        return self.children is []
+        return len(self.children) == 0
 
-    def split(self) ->('QuadNode', 'QuadNode', 'QuadNode', 'QuadNode'):
-        node_top_left = QuadNode(x=self.x, y=self.y, size = self.size/2)
-        node_top_right = QuadNode(x=self.x+1+self.size/2, y=self.y, size=self.size/2)
-        node_bottom_right = QuadNode(x=self.x+1+self.size/2, y=self.y+1+self.size/2, size=self.size/2)
-        node_bottom_left = QuadNode(x=self.x, y=self.y+1+self.size/2, size=self.size/2)
+    def split(self) -> ('QuadNode', 'QuadNode', 'QuadNode', 'QuadNode'):
+        # TODO: fix pixel coordinates since one line of pixels is not filled between two nodes
+        node_top_left = QuadNode(x=self.x, y=self.y, size=int(self.size / 2))
+        node_top_right = QuadNode(x=int(self.x + self.size / 2), y=self.y, size=int(self.size / 2))
+        node_bottom_right = QuadNode(x=int(self.x + self.size / 2), y=int(self.y + self.size / 2),
+                                     size=int(self.size / 2))
+        node_bottom_left = QuadNode(x=self.x, y=int(self.y + self.size / 2), size=int(self.size / 2))
         self.children = [node_top_left, node_top_right, node_bottom_right, node_bottom_left]
         return node_top_left, node_top_right, node_bottom_right, node_bottom_left
 

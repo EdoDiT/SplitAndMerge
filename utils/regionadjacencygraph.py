@@ -2,11 +2,10 @@ import networkx as nx
 import numpy as np
 
 from utils.quadnode import QuadNode
-from utils.quadtree import Quadtree
 
 
 class RegionAdjacencyGraph:
-    def __init__(self, quadtree: Quadtree):
+    def __init__(self, quadtree: QuadNode):
         self.graph = nx.Graph()
         self.quadtree = quadtree
         self._build_graph(self.quadtree.root)
@@ -29,5 +28,6 @@ class RegionAdjacencyGraph:
                 merged_nodes.add(node1)
                 merged_nodes.add(node2)
 
+        """TODO: Finish mergin process and check if this is correct"""
         for node in merged_nodes:
             self.graph.remove_node(node)
