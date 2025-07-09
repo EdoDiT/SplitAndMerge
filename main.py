@@ -16,17 +16,8 @@ split_and_merger = SequentialSplitAndMerge(
     merge_mean=lambda block: np.mean(block),  # Mean function for merging
     min_block_size=10  # Minimum size of blocks to consider
 )
-# Build the quadtree
-split_and_merger._build_quadtree()
-# Build the region adjacency graph
-split_and_merger._build_region_adjacency_graph()
-split_and_merger._clean_children()
-# Perform merging
-split_and_merger._merge()
-# Display the split result
-img_1 = split_and_merger.get_split_image()
-img_2 = split_and_merger.get_merge_image()
+img_1, img_2 = split_and_merger.process_image()
 cv2.imshow('Split Result', img_1)
-cv2.imshow('Merge Result', img_2)
+cv2.imshow('Merged Result', img_2)
 cv2.waitKey(0)
 cv2.destroyAllWindows()

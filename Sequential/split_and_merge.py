@@ -53,7 +53,7 @@ class SequentialSplitAndMerge:
         weighted_means2 = np.average(means2, axis=0, weights=areas2)
         return self.merging_function(weighted_means1, weighted_means2)
 
-    def _build_quadtree(self):
+    def build_quadtree(self):
         """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
         Saves leaf nodes in self.split_result, and tree in self.quadtree."""
         queue = Queue() # TODO: check if thread safe
@@ -71,7 +71,7 @@ class SequentialSplitAndMerge:
                 self.split_result.append(node)
         return
 
-    def _build_region_adjacency_graph(self):
+    def build_region_adjacency_graph(self):
         """Builds a region adjacency graph from the quadtree.
         The graph is built by adding nodes for each region and edges between consecutive children.
         When a new node is added, it checks if it is contiguous with any of father's neighbours and adds edges accordingly."""
@@ -92,7 +92,7 @@ class SequentialSplitAndMerge:
                 for i in range((len(children) - 1)):
                     self.region_adjacency_graph.add_edge((children[i], ), (children[i+1], ))
                 self.region_adjacency_graph.remove_node((node, ))
-        # self.region_adjacency_graph = self.region_adjacency_graph
+        self._clean_children()
         return
 
     def _clean_children(self):
@@ -115,8 +115,8 @@ class SequentialSplitAndMerge:
         self.region_adjacency_graph.remove_node(graph_node2)
         return new_graph_node
 
-    def _merge(self):
-        self._build_region_adjacency_graph()
+    def merge(self):
+        self.build_region_adjacency_graph()
         queue = Queue()
         for graph_node in self.region_adjacency_graph.nodes():
             queue.put(graph_node)
@@ -180,3 +180,14 @@ class SequentialSplitAndMerge:
                 else:
                     self.merge_image[y:y + size, x:x + size] = np.full((size, size, 3), avg_color)
         return self.merge_image
+
+    def process_image(self)-> Tuple[ndarray, ndarray]:
+        """Processes the image by building the quadtree, merging regions, and returning the split and merged images.
+        Returns:
+            Tuple[ndarray, ndarray]: The split and merged images.
+        """
+        self.build_quadtree()
+        self.build_region_adjacency_graph()
+        self._clean_children()
+        self.merge()
+        return self.get_split_image(), self.get_merge_image()
