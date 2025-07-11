@@ -1,14 +1,16 @@
 from typing import Callable, Tuple
 import networkx as nx
 from queue import Queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 
 import numpy as np
 from numpy import ndarray
 
 from utils.quadnode import QuadNode
 
-
-class SequentialSplitAndMerge:
+# 25 seconds per iteration on 1024x1024
+class FutureSplitAndMerge:
     def __init__(
             self,
             image: ndarray,
@@ -53,23 +55,33 @@ class SequentialSplitAndMerge:
         weighted_means2 = np.average(means2, axis=0, weights=areas2)
         return self.merging_function(weighted_means1, weighted_means2)
 
-    # 25 seconds per iteration on 1024x1024
     def build_quadtree(self):
-        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
-        Saves leaf nodes in self.split_result, and tree in self.quadtree."""
-        queue = Queue() # TODO: check if thread safe
+        """Parallel version: Builds a quadtree from the image by recursively splitting it into homogeneous blocks."""
         self.quadtree = QuadNode(x=0, y=0, size=self.image.shape[0])
-        queue.put(self.quadtree)
-        while queue.qsize() != 0:
-            node = queue.get()
+        split_result = []
+        lock = threading.Lock()
+
+        def process_node(node):
             if node.size > self.min_block_size and not self._is_homogeneous(node):
-                node_top_left, node_top_right, node_bottom_right, node_bottom_left = QuadNode.split(node)
-                queue.put(node_top_left)
-                queue.put(node_top_right)
-                queue.put(node_bottom_right)
-                queue.put(node_bottom_left)
+                return QuadNode.split(node)
             else:
-                self.split_result.append(node)
+                with lock:
+                    split_result.append(node)
+                return None
+
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_node, self.quadtree)]
+            while futures:
+                done, _ = as_completed(futures), []
+                new_futures = []
+                for future in done:
+                    result = future.result()
+                    if result:
+                        for child in result:
+                            new_futures.append(executor.submit(process_node, child))
+                futures = new_futures
+
+        self.split_result = split_result
         return
 
     def build_region_adjacency_graph(self):

@@ -6,9 +6,13 @@ import numpy as np
 from numpy import ndarray
 
 from utils.quadnode import QuadNode
+import posix_ipc
+import mmap
+import multiprocessing as mp
+import pickle
 
 
-class SequentialSplitAndMerge:
+class SharedMemoryParallelSplitAndMerge:
     def __init__(
             self,
             image: ndarray,
@@ -54,22 +58,60 @@ class SequentialSplitAndMerge:
         return self.merging_function(weighted_means1, weighted_means2)
 
     # 25 seconds per iteration on 1024x1024
-    def build_quadtree(self):
-        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
-        Saves leaf nodes in self.split_result, and tree in self.quadtree."""
-        queue = Queue() # TODO: check if thread safe
-        self.quadtree = QuadNode(x=0, y=0, size=self.image.shape[0])
-        queue.put(self.quadtree)
-        while queue.qsize() != 0:
-            node = queue.get()
-            if node.size > self.min_block_size and not self._is_homogeneous(node):
-                node_top_left, node_top_right, node_bottom_right, node_bottom_left = QuadNode.split(node)
-                queue.put(node_top_left)
-                queue.put(node_top_right)
-                queue.put(node_bottom_right)
-                queue.put(node_bottom_left)
-            else:
-                self.split_result.append(node)
+    def build_quadtree(self, num_workers=4):
+        """Parallel build of a quadtree using POSIX shared memory and multiprocessing."""
+        # Shared memory for image
+        shm_name = "/img_shm"
+        img_bytes = self.image.tobytes()
+        shm = posix_ipc.SharedMemory(shm_name, flags=posix_ipc.O_CREX, size=len(img_bytes))
+        mapfile = mmap.mmap(shm.fd, shm.size)
+        shm.close_fd()
+        mapfile.write(img_bytes)
+        mapfile.seek(0)
+
+        # Manager for shared result list
+        manager = mp.Manager()
+        split_result = manager.list()
+        task_queue = manager.Queue()
+        root = QuadNode(x=0, y=0, size=self.image.shape[0])
+        task_queue.put(pickle.dumps(root))
+
+        def worker(split_func, min_block_size, shape):
+            import numpy as np
+            import pickle
+            import posix_ipc, mmap
+            shm = posix_ipc.SharedMemory(shm_name)
+            mapfile = mmap.mmap(shm.fd, shm.size)
+            shm.close_fd()
+            img = np.frombuffer(mapfile, dtype=self.image.dtype).reshape(shape)
+            while True:
+                try:
+                    node_bytes = task_queue.get(timeout=1)
+                except:
+                    break
+                node = pickle.loads(node_bytes)
+                x, y, size = node.x, node.y, node.size
+                block = img[y:y+size, x:x+size]
+                if size > min_block_size and not split_func(block):
+                    children = node.split()
+                    for child in children:
+                        task_queue.put(pickle.dumps(child))
+                else:
+                    split_result.append(node)
+            mapfile.close()
+
+        # Start workers
+        workers = []
+        for _ in range(num_workers):
+            p = mp.Process(target=worker, args=(self.split_function, self.min_block_size, self.image.shape))
+            p.start()
+            workers.append(p)
+        for p in workers:
+            p.join()
+        mapfile.close()
+        posix_ipc.unlink_shared_memory(shm_name)
+        self.split_result = list(split_result)
+        self.quadtree = root
         return
 
     def build_region_adjacency_graph(self):

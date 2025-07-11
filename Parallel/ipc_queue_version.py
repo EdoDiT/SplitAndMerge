@@ -1,6 +1,15 @@
 from typing import Callable, Tuple
 import networkx as nx
 from queue import Queue
+import posix_ipc
+import pickle
+import multiprocessing
+import os
+import time
+
+MAX_MSG_SIZE = 8192  # Max message size, adjust if necessary
+WORK_QUEUE_NAME = "/quadtree_queue"
+RESULT_QUEUE_NAME = "/quadtree_result"
 
 import numpy as np
 from numpy import ndarray
@@ -8,7 +17,7 @@ from numpy import ndarray
 from utils.quadnode import QuadNode
 
 
-class SequentialSplitAndMerge:
+class PosixQueueSplitAndMerge:
     def __init__(
             self,
             image: ndarray,
@@ -36,6 +45,117 @@ class SequentialSplitAndMerge:
         self.split_result = []
         self.merge_result = []
 
+    def _worker_process(self, worker_id):
+        work_queue = posix_ipc.MessageQueue(WORK_QUEUE_NAME)
+        result_queue = posix_ipc.MessageQueue(RESULT_QUEUE_NAME)
+
+        while True:
+            try:
+                # Get a node to process with timeout
+                message, _ = work_queue.receive(timeout=1)
+                task = pickle.loads(message)
+
+                if task == "DONE":
+                    break
+
+                node = task
+                block = self.image[node.y:node.y + node.size, node.x:node.x + node.size]
+
+                # Check homogeneity
+                if node.size > self.min_block_size and not self.split_function(block):
+                    # Node needs to be split
+                    result_queue.send(pickle.dumps(("SPLIT", node)))
+                else:
+                    # Leaf node
+                    result_queue.send(pickle.dumps(("LEAF", node)))
+
+            except posix_ipc.BusyError:
+                # Timeout occurred, just continue
+                continue
+            except Exception as e:
+                print(f"Worker {worker_id} error: {str(e)}")
+                continue
+
+    def build_quadtree(self, num_workers=4):
+        # Clean up any existing queues
+        for queue_name in [WORK_QUEUE_NAME, RESULT_QUEUE_NAME]:
+            try:
+                posix_ipc.unlink_message_queue(queue_name)
+            except:
+                pass
+
+        # Create message queues
+        work_queue = posix_ipc.MessageQueue(WORK_QUEUE_NAME, posix_ipc.O_CREX)
+        result_queue = posix_ipc.MessageQueue(RESULT_QUEUE_NAME, posix_ipc.O_CREX)
+
+        # Start worker processes
+        workers = []
+        for i in range(num_workers):
+            p = multiprocessing.Process(target=self._worker_process, args=(i,))
+            p.daemon = True
+            p.start()
+            workers.append(p)
+
+        # Initialize root node and work queue
+        self.quadtree = QuadNode(x=0, y=0, size=self.image.shape[0])
+        self.split_result = []
+
+        # Keep track of work
+        nodes_to_process = 1  # Start with the root
+        nodes_in_flight = 0
+
+        # Add root node to work queue
+        work_queue.send(pickle.dumps(self.quadtree))
+        nodes_in_flight += 1
+
+        # Process nodes until done
+        max_iters = 100000
+        for i in range(max_iters):
+            if nodes_in_flight == 0:
+                break
+
+            try:
+                # Get a result with timeout
+                message, _ = result_queue.receive(timeout=0.5)
+                result = pickle.loads(message)
+                nodes_in_flight -= 1
+
+                result_type, node = result
+
+                if result_type == "LEAF":
+                    # Terminal node - add to results
+                    self.split_result.append(node)
+                elif result_type == "SPLIT":
+                    # Split node and add children to work queue
+                    children = QuadNode.split(node)
+                    for child in children:
+                        work_queue.send(pickle.dumps(child))
+                        nodes_in_flight += 1
+                    nodes_to_process += len(children)
+
+            except posix_ipc.BusyError:
+                # Timeout occurred, just continue
+                continue
+            except Exception as e:
+                print(f"Main process error: {str(e)}")
+
+        # Terminate worker processes
+        for _ in range(num_workers):
+            work_queue.send(pickle.dumps("DONE"))
+
+        # Clean up
+        for p in workers:
+            p.join(timeout=1)
+            if p.is_alive():
+                p.terminate()
+
+        work_queue.close()
+        result_queue.close()
+        posix_ipc.unlink_message_queue(WORK_QUEUE_NAME)
+        posix_ipc.unlink_message_queue(RESULT_QUEUE_NAME)
+
+        print(f"Split complete with {len(self.split_result)} leaf nodes")
+
     def _is_homogeneous(self, node: QuadNode) -> bool:
         x = node.x
         y = node.y
@@ -52,25 +172,6 @@ class SequentialSplitAndMerge:
         weighted_means1 = np.average(means1, axis=0, weights=areas1)
         weighted_means2 = np.average(means2, axis=0, weights=areas2)
         return self.merging_function(weighted_means1, weighted_means2)
-
-    # 25 seconds per iteration on 1024x1024
-    def build_quadtree(self):
-        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
-        Saves leaf nodes in self.split_result, and tree in self.quadtree."""
-        queue = Queue() # TODO: check if thread safe
-        self.quadtree = QuadNode(x=0, y=0, size=self.image.shape[0])
-        queue.put(self.quadtree)
-        while queue.qsize() != 0:
-            node = queue.get()
-            if node.size > self.min_block_size and not self._is_homogeneous(node):
-                node_top_left, node_top_right, node_bottom_right, node_bottom_left = QuadNode.split(node)
-                queue.put(node_top_left)
-                queue.put(node_top_right)
-                queue.put(node_bottom_right)
-                queue.put(node_bottom_left)
-            else:
-                self.split_result.append(node)
-        return
 
     def build_region_adjacency_graph(self):
         """Builds a region adjacency graph from the quadtree.
