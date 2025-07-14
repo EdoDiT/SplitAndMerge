@@ -1,3 +1,4 @@
+import gc
 from typing import Callable, Tuple
 import networkx as nx
 from queue import Queue
@@ -59,8 +60,7 @@ class SharedMemoryParallelSplitAndMerge:
 
     # 25 seconds per iteration on 1024x1024
     def build_quadtree(self, num_workers=4):
-        """Parallel build of a quadtree using POSIX shared memory and multiprocessing."""
-        # Shared memory for image
+        """Parallel build of a quadtree using POSIX shared memory and multiprocessing, using a stack and shared dict for structure."""
         shm_name = "/img_shm"
         img_bytes = self.image.tobytes()
         shm = posix_ipc.SharedMemory(shm_name, flags=posix_ipc.O_CREX, size=len(img_bytes))
@@ -69,35 +69,52 @@ class SharedMemoryParallelSplitAndMerge:
         mapfile.write(img_bytes)
         mapfile.seek(0)
 
-        # Manager for shared result list
         manager = mp.Manager()
         split_result = manager.list()
-        task_queue = manager.Queue()
+        node_dict = manager.dict()  # key: (x, y, size), value: {'node': QuadNode, 'children': [keys]}
+        stack = manager.list()  # LIFO stack
+        lock = manager.Lock()
         root = QuadNode(x=0, y=0, size=self.image.shape[0])
-        task_queue.put(pickle.dumps(root))
+        root_key = (root.x, root.y, root.size)
+        node_dict[root_key] = {'node': pickle.dumps(root), 'children': []}
+        stack.append(pickle.dumps(root_key))
 
         def worker(split_func, min_block_size, shape):
-            import numpy as np
-            import pickle
-            import posix_ipc, mmap
             shm = posix_ipc.SharedMemory(shm_name)
             mapfile = mmap.mmap(shm.fd, shm.size)
             shm.close_fd()
             img = np.frombuffer(mapfile, dtype=self.image.dtype).reshape(shape)
             while True:
+                with lock:
+                    if len(stack) == 0:
+                        break
+                    node_key_bytes = stack.pop()
+                node_key = pickle.loads(node_key_bytes)
                 try:
-                    node_bytes = task_queue.get(timeout=1)
-                except:
-                    break
-                node = pickle.loads(node_bytes)
+                    node_data = node_dict[node_key]
+                except KeyError:
+                    continue  # Node was already processed by another worker
+                node = pickle.loads(node_data['node'])
                 x, y, size = node.x, node.y, node.size
                 block = img[y:y+size, x:x+size]
                 if size > min_block_size and not split_func(block):
                     children = node.split()
+                    child_keys = []
                     for child in children:
-                        task_queue.put(pickle.dumps(child))
+                        child_key = (child.x, child.y, child.size)
+                        with lock:
+                            if child_key not in node_dict:
+                                node_dict[child_key] = {'node': pickle.dumps(child), 'children': []}
+                            stack.append(pickle.dumps(child_key))
+                        child_keys.append(child_key)
+                    with lock:
+                        node_dict[node_key]['children'] = tuple(child_keys)
+                        if node_key == root_key:
+                            print(f"[DEBUG] (atomic) Root node children_keys set: {child_keys}")
                 else:
-                    split_result.append(node)
+                    split_result.append(node_key)
+            del img
+            gc.collect()
             mapfile.close()
 
         # Start workers
@@ -110,8 +127,16 @@ class SharedMemoryParallelSplitAndMerge:
             p.join()
         mapfile.close()
         posix_ipc.unlink_shared_memory(shm_name)
-        self.split_result = list(split_result)
-        self.quadtree = root
+        self.split_result = [pickle.loads(node_dict[k]['node']) for k in split_result]
+
+        # Reconstruct the tree from node_dict
+        def reconstruct_tree(node_key):
+            node_data = node_dict[node_key]
+            node = pickle.loads(node_data['node'])
+            children_keys = node_data['children']
+            node.children = [reconstruct_tree(child_key) for child_key in children_keys]
+            return node
+        self.quadtree = reconstruct_tree(root_key)
         return
 
     def build_region_adjacency_graph(self):

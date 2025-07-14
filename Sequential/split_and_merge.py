@@ -93,12 +93,7 @@ class SequentialSplitAndMerge:
                 for i in range((len(children) - 1)):
                     self.region_adjacency_graph.add_edge((children[i], ), (children[i+1], ))
                 self.region_adjacency_graph.remove_node((node, ))
-        self._clean_children()
         return
-
-    def _clean_children(self):
-        for node in self.region_adjacency_graph.nodes():
-            node[0].children = []
 
     def _merge_nodes(self, graph_node1: Tuple[QuadNode], graph_node2: Tuple[QuadNode]) -> Tuple[QuadNode]:
         # if graph_node1 == graph_node2:
@@ -189,6 +184,5 @@ class SequentialSplitAndMerge:
         """
         self.build_quadtree()
         self.build_region_adjacency_graph()
-        self._clean_children()
         self.merge()
         return self.get_split_image(), self.get_merge_image()
