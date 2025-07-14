@@ -114,7 +114,6 @@ class SequentialSplitAndMerge:
         return new_graph_node
 
     def merge(self):
-        self.build_region_adjacency_graph()
         queue = Queue()
         for graph_node in self.region_adjacency_graph.nodes():
             queue.put(graph_node)
