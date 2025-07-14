@@ -1,6 +1,6 @@
 import gc
-from typing import Callable, Tuple
-import networkx as nx
+from collections import deque
+from typing import Callable, Tuple, List
 from queue import Queue
 
 import numpy as np
@@ -18,25 +18,18 @@ class SequentialSplitAndMerge:
             merge_mean: Callable,
             min_block_size: int
     ) -> None:
-        """Initializes the SequentialSplitAndMerge class.
-        Args:
-            image (ndarray): The input image to be segmented.
-            split_function (Callable): A function that determines if a block should be split.
-            merging_function (Callable): A function that determines if two blocks can be merged.
-            min_block_size (int): The minimum size of a block to be considered for splitting.
-        """
         self.split_function = split_function
         self.merging_function = merging_function
         self.merge_mean = merge_mean
-        self.region_adjacency_graph = None
         self.image = image
         self.split_image = image.copy()  # Initialize with the original image
         self.merge_image = image.copy()  # Initialize with the original image
         self.root = None
         self.quadtree = dict()
+        self.graph_nodes = [] # A single node is a list of tuples, where each tuple represents a block of the image
+        self.graph_edges = dict() # The first tuple of a node is used as primary key for the edges. The table is symmetric. Each entry contains the full tuple list of all the neighbours
         self.min_block_size = min_block_size
         self.split_result = []
-        self.merge_result = []
 
     def _is_homogeneous(self, node: Tuple[int, int, int]) -> bool:
         x = node[0]
@@ -46,7 +39,6 @@ class SequentialSplitAndMerge:
         return self.split_function(block)
 
     def _are_similar(self, region1: tuple, region2: tuple) -> bool:
-        # Aggregate all pixels from both regions
         means1 = [self.merge_mean(self.image[n[1]:n[1]+n[2], n[0]:n[0]+n[2]]) for n in region1]
         means2 = [self.merge_mean(self.image[n[1]:n[1]+n[2], n[0]:n[0]+n[2]]) for n in region2]
         areas1 = [n[2] * n[2] for n in region1]
@@ -58,16 +50,16 @@ class SequentialSplitAndMerge:
     def build_quadtree(self):
         """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
         Saves leaf nodes in self.split_result, and tree in self.quadtree."""
-        queue = Queue() # TODO: check if thread safe
+        task_stack = deque()
         self.root = (0, 0, self.image.shape[0])
-        queue.put(self.root)
-        while queue.qsize() != 0:
-            node = queue.get()
+        task_stack.append(self.root)
+        while len(task_stack) != 0:
+            node = task_stack.pop()
             if node[2] > self.min_block_size and not self._is_homogeneous(node):
                 children = split(node)
                 self.quadtree[node] = children
                 for child in children:
-                    queue.put(child)
+                    task_stack.append(child)
             else:
                 self.split_result.append(node)
         return
@@ -76,58 +68,71 @@ class SequentialSplitAndMerge:
         """Builds a region adjacency graph from the quadtree.
         The graph is built by adding nodes for each region and edges between consecutive children.
         When a new node is added, it checks if it is contiguous with any of father's neighbours and adds edges accordingly."""
-        queue = Queue()
-        self.region_adjacency_graph = nx.Graph()
-        self.region_adjacency_graph.add_node((self.root,))
-        queue.put(self.root)
-        while queue.qsize() != 0:
-            node = queue.get()
+        task_stack = deque()
+        task_stack.append(self.root)
+        self.graph_edges[self.root] = []
+        while len(task_stack) != 0:
+            node = task_stack.pop()
             children = self.quadtree.get(node)
             if children:
                 for child in children:
-                    self.region_adjacency_graph.add_node((child, ))
-                    queue.put(child)
-                    for neighbour in self.region_adjacency_graph.neighbors((node, )):
+                    task_stack.append(child)
+                    for neighbour in self.graph_edges.get(node, []):
                         if are_contiguous(neighbour[0], child):
-                            self.region_adjacency_graph.add_edge(neighbour, (child, ))
+                            self.graph_edges[child] = self.graph_edges.get(child, []) + [neighbour]
+                            self.graph_edges[neighbour[0]] = self.graph_edges.get(neighbour[0], []) + [[child]]
                 for i in range((len(children) - 1)):
-                    self.region_adjacency_graph.add_edge((children[i], ), (children[i+1], ))
-                self.region_adjacency_graph.remove_node((node, ))
+                    self.graph_edges[children[i]] = self.graph_edges.get(children[i], []) + [[children[i+1]]]
+                    self.graph_edges[children[i+1]] = self.graph_edges.get(children[i+1], []) + [[children[i]]]
+                self.graph_edges[children[0]] = self.graph_edges.get(children[0], []) + [[children[3]]]
+                self.graph_edges[children[3]] = self.graph_edges.get(children[3], []) + [[children[0]]]
+                for neighbour in self.graph_edges.pop(node, []):
+                    self.graph_edges[neighbour[0]].remove([node])
+            else:
+                self.graph_nodes.append([node])
         del self.quadtree
         gc.collect()
         return
 
     def _merge_nodes(
             self,
-            graph_node1: Tuple[Tuple[int, int, int]],
-            graph_node2: Tuple[Tuple[int, int, int]]
-    ) -> Tuple[Tuple[int, int, int]]:
+            graph_node1: List[Tuple[int, int, int]],
+            graph_node2: List[Tuple[int, int, int]]
+    ) -> List[Tuple[int, int, int]]:
         new_graph_node = graph_node1 + graph_node2
-        self.region_adjacency_graph.add_node(new_graph_node)
-        graph_node_neighbours = list(self.region_adjacency_graph.neighbors(graph_node1))
-        for n in graph_node_neighbours:
-            self.region_adjacency_graph.add_edge(new_graph_node, n)
-        for n in self.region_adjacency_graph.neighbors(graph_node2):
-            self.region_adjacency_graph.add_edge(new_graph_node, n)
-        self.region_adjacency_graph.remove_node(graph_node1)
-        self.region_adjacency_graph.remove_node(graph_node2)
+        self.graph_nodes.remove(graph_node1)
+        self.graph_nodes.remove(graph_node2)
+        self.graph_nodes.append(new_graph_node)
+        for neighbour in self.graph_edges.get(graph_node2[0]):
+            self.graph_edges[neighbour[0]].remove(graph_node2)
+        for neighbour in self.graph_edges.get(graph_node1[0]):
+            self.graph_edges[neighbour[0]].remove(graph_node1)
+        self.graph_edges[graph_node2[0]].remove(graph_node1)
+        neighbours1 = self.graph_edges.pop(graph_node1[0])
+        neighbours2 = self.graph_edges.pop(graph_node2[0])
+        all_neighbours = neighbours1 + neighbours2
+        actual_neighbours = []
+        for neighbour in all_neighbours:
+            if neighbour not in actual_neighbours:
+                actual_neighbours.append(neighbour)
+        self.graph_edges[new_graph_node[0]] = actual_neighbours
+        for neighbour in self.graph_edges.get(new_graph_node[0], []):
+            self.graph_edges[neighbour[0]] = self.graph_edges.get(neighbour[0], []) + [new_graph_node]
         return new_graph_node
 
     def merge(self):
         queue = Queue()
-        for graph_node in self.region_adjacency_graph.nodes():
+        for graph_node in self.graph_nodes:
             queue.put(graph_node)
         while queue.qsize() != 0:
             graph_node = queue.get()
-            if graph_node in self.region_adjacency_graph:
-                neighbours = list(self.region_adjacency_graph.neighbors(graph_node))
+            if graph_node in self.graph_nodes:
+                neighbours = self.graph_edges.get(graph_node[0], [])
                 for neighbour in neighbours:
-                    if self._are_similar(graph_node, neighbour) and graph_node != neighbour:
+                    if self._are_similar(graph_node, neighbour):
                         new_graph_node = self._merge_nodes(graph_node, neighbour)
                         queue.put(new_graph_node)
                         break
-        for graph_node in self.region_adjacency_graph.nodes():
-            self.merge_result.append(graph_node)
         return
 
     def get_split_image(self):
@@ -143,7 +148,7 @@ class SequentialSplitAndMerge:
 
     def get_merge_image(self):
         """Returns the merged image"""
-        for node in self.merge_result:
+        for node in self.graph_nodes:
             if len(self.image.shape) == 2:  # Grayscale image
                 avg_color = 0
             else:  # RGB image
