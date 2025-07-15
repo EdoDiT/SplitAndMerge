@@ -13,6 +13,7 @@ def split(node: Tuple[int, int, int]) -> [
     return [node_top_left, node_top_right, node_bottom_right, node_bottom_left]
 
 def are_contiguous(node1: Tuple[int, int, int], node2: Tuple[int, int, int]) -> bool:
+    """Checks if two nodes are contiguous. Nodes are tuples of (x, y, size)"""
     if node1[0] <= node2[0]:
         pass
     else:

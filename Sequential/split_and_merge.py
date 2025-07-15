@@ -10,6 +10,10 @@ from utils.utility_functions import split, are_contiguous
 
 
 class SequentialSplitAndMerge:
+    """A class to perform sequential split and merge on an image.
+    This class builds a quadtree from the image, constructs a region adjacency graph,
+    and merges regions based on specified functions for splitting and merging.
+    """
     def __init__(
             self,
             image: ndarray,
@@ -18,6 +22,14 @@ class SequentialSplitAndMerge:
             merge_mean: Callable,
             min_block_size: int
     ) -> None:
+        """        Initializes the SequentialSplitAndMerge class.
+        Args:
+            image (ndarray): The input image to be processed.
+            split_function (Callable): Function to determine if a block is homogeneous.
+            merging_function (Callable): Function to determine if two blocks can be merged.
+            merge_mean (Callable): Function to compute the mean of a block for merging.
+            min_block_size (int): Minimum size of blocks to consider for splitting.
+        """
         self.split_function = split_function
         self.merging_function = merging_function
         self.merge_mean = merge_mean
@@ -32,6 +44,12 @@ class SequentialSplitAndMerge:
         self.split_result = []
 
     def _is_homogeneous(self, node: Tuple[int, int, int]) -> bool:
+        """Checks if a block of the image is homogeneous using the split function.
+        Args:
+            node (Tuple[int, int, int]): A tuple representing the block (x, y, size).
+        Returns:
+            bool: True if the block is homogeneous, False otherwise.
+        """
         x = node[0]
         y = node[1]
         size = node[2]
@@ -39,6 +57,13 @@ class SequentialSplitAndMerge:
         return self.split_function(block)
 
     def _are_similar(self, region1: tuple, region2: tuple) -> bool:
+        """Checks if two regions are similar by computing the weighted mean based on blocks belonging to each region.
+        Args:
+            region1 (tuple): A tuple representing the first region (x, y, size).
+            region2 (tuple): A tuple representing the second region (x, y, size).
+        Returns:
+            bool: True if the regions are similar, False otherwise.
+        """
         means1 = [self.merge_mean(self.image[n[1]:n[1]+n[2], n[0]:n[0]+n[2]]) for n in region1]
         means2 = [self.merge_mean(self.image[n[1]:n[1]+n[2], n[0]:n[0]+n[2]]) for n in region2]
         areas1 = [n[2] * n[2] for n in region1]
@@ -49,7 +74,10 @@ class SequentialSplitAndMerge:
 
     def build_quadtree(self):
         """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
-        Saves leaf nodes in self.split_result, and tree in self.quadtree."""
+        The quadtree is built by checking if a block is homogeneous using the split function.
+        If a block is not homogeneous, it is split into four children blocks.
+        The process continues until all blocks are homogeneous or the minimum block size is reached.
+        """
         task_stack = deque()
         self.root = (0, 0, self.image.shape[0])
         task_stack.append(self.root)
@@ -66,8 +94,10 @@ class SequentialSplitAndMerge:
 
     def build_region_adjacency_graph(self):
         """Builds a region adjacency graph from the quadtree.
-        The graph is built by adding nodes for each region and edges between consecutive children.
-        When a new node is added, it checks if it is contiguous with any of father's neighbours and adds edges accordingly."""
+        The graph is constructed by iterating through the quadtree and adding edges between contiguous blocks.
+        Each node in the graph represents a block of the image, and edges represent adjacency between blocks.
+        The graph is built by checking if two blocks are contiguous using the are_contiguous function, or by knowing it from their parent.
+        """
         task_stack = deque()
         task_stack.append(self.root)
         self.graph_edges[self.root] = []
@@ -99,6 +129,13 @@ class SequentialSplitAndMerge:
             graph_node1: List[Tuple[int, int, int]],
             graph_node2: List[Tuple[int, int, int]]
     ) -> List[Tuple[int, int, int]]:
+        """Merges two graph nodes into a new graph node.
+        Args:
+            graph_node1 (List[Tuple[int, int, int]]): The first graph node to merge.
+            graph_node2 (List[Tuple[int, int, int]]): The second graph node to merge.
+        Returns:
+            List[Tuple[int, int, int]]: The new graph node created by merging the two input nodes.
+        """
         new_graph_node = graph_node1 + graph_node2
         self.graph_nodes.remove(graph_node1)
         self.graph_nodes.remove(graph_node2)
@@ -120,6 +157,8 @@ class SequentialSplitAndMerge:
         return new_graph_node
 
     def merge(self):
+        """Iteratively merges similar regions in the graph until no more merges can be performed.
+        The merging is done by checking if two contiguous graph nodes are similar."""
         queue = Queue()
         for graph_node in self.graph_nodes:
             queue.put(graph_node)
