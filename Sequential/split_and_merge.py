@@ -108,16 +108,15 @@ class SequentialSplitAndMerge:
         for neighbour in self.graph_edges.get(graph_node1[0]):
             self.graph_edges[neighbour[0]].remove(graph_node1)
         self.graph_edges[graph_node2[0]].remove(graph_node1)
-        neighbours1 = self.graph_edges.pop(graph_node1[0])
+        neighbours1 = self.graph_edges.get(graph_node1[0])
         neighbours2 = self.graph_edges.pop(graph_node2[0])
-        all_neighbours = neighbours1 + neighbours2
-        actual_neighbours = []
-        for neighbour in all_neighbours:
-            if neighbour not in actual_neighbours:
-                actual_neighbours.append(neighbour)
-        self.graph_edges[new_graph_node[0]] = actual_neighbours
+        new_neighbours = []
+        for neighbour in neighbours2:
+            if neighbour not in neighbours1:
+                new_neighbours.append(neighbour)
+        self.graph_edges[new_graph_node[0]].extend(new_neighbours)
         for neighbour in self.graph_edges.get(new_graph_node[0], []):
-            self.graph_edges[neighbour[0]] = self.graph_edges.get(neighbour[0], []) + [new_graph_node]
+            self.graph_edges[neighbour[0]].extend([new_graph_node])
         return new_graph_node
 
     def merge(self):
