@@ -1,4 +1,6 @@
 import gc
+import multiprocessing as mp
+from multiprocessing import shared_memory
 from collections import deque
 from typing import Callable, Tuple, List
 from queue import Queue
@@ -9,7 +11,7 @@ from numpy import ndarray
 from utils.utility_functions import split, are_contiguous
 
 
-class SequentialSplitAndMerge:
+class ParallelSplitAndMerge:
     """A class to perform sequential split and merge on an image.
     This class builds a quadtree from the image, constructs a region adjacency graph,
     and merges regions based on specified functions for splitting and merging.
@@ -20,7 +22,8 @@ class SequentialSplitAndMerge:
             split_function: Callable,
             merging_function: Callable,
             merge_mean: Callable,
-            min_block_size: int
+            min_block_size: int,
+            num_workers: int = None
     ) -> None:
         """        Initializes the SequentialSplitAndMerge class.
         Args:
@@ -29,6 +32,7 @@ class SequentialSplitAndMerge:
             merging_function (Callable): Function to determine if two blocks can be merged.
             merge_mean (Callable): Function to compute the mean of a block for merging.
             min_block_size (int): Minimum size of blocks to consider for splitting.
+            num_workers (int): Number of worker processes for parallel processing. If None, uses CPU count.
         """
         self.split_function = split_function
         self.merging_function = merging_function
@@ -42,6 +46,104 @@ class SequentialSplitAndMerge:
         self.graph_edges = dict() # The first tuple of a node is used as primary key for the edges. The table is symmetric. Each entry contains the full tuple list of all the neighbours
         self.min_block_size = min_block_size
         self.split_result = []
+
+        # Parallel processing setup
+        self.num_workers = num_workers if num_workers is not None else mp.cpu_count()
+        self.shared_image = None
+        self.image_shape = image.shape
+        self.image_dtype = image.dtype
+        print("Starting Parallel setup")
+        # Create shared memory for the image
+        self._setup_shared_memory()
+
+        # Multiprocessing synchronization primitives
+        self.manager = mp.Manager()
+        self.shared_task_stack = self.manager.list()
+        self.shared_split_result = self.manager.list()
+        self.shared_quadtree = self.manager.dict()
+        self.task_lock = mp.Lock()
+        self.result_lock = mp.Lock()
+        print("Parallel setup complete")
+
+    def _setup_shared_memory(self):
+        """Sets up shared memory for the image data."""
+        # Create shared memory buffer for the image
+        image_bytes = self.image.nbytes
+        self.shared_image = shared_memory.SharedMemory(create=True, size=image_bytes)
+
+        # Create numpy array from shared memory
+        shared_array = np.ndarray(self.image_shape, dtype=self.image_dtype, buffer=self.shared_image.buf)
+        shared_array[:] = self.image[:]
+
+    def _cleanup_shared_memory(self):
+        """Cleans up shared memory resources."""
+        if self.shared_image is not None:
+            self.shared_image.close()
+            self.shared_image.unlink()
+
+    def __del__(self):
+        """Destructor to clean up shared memory."""
+        try:
+            self._cleanup_shared_memory()
+        except:
+            pass
+
+    @staticmethod
+    def _worker_process(shared_image_name, image_shape, image_dtype, shared_task_stack,
+                       shared_split_result, shared_quadtree, task_lock, result_lock,
+                       split_function, min_block_size):
+        """Worker process function for parallel quadtree building.
+
+        Args:
+            shared_image_name: Name of the shared memory block containing the image
+            image_shape: Shape of the image
+            image_dtype: Data type of the image
+            shared_task_stack: Shared task stack (managed list)
+            shared_split_result: Shared split result list (managed list)
+            shared_quadtree: Shared quadtree dictionary (managed dict)
+            task_lock: Lock for task stack access
+            result_lock: Lock for result list access
+            split_function: Function to determine if a block is homogeneous
+            min_block_size: Minimum block size for splitting
+        """
+        # Connect to shared memory
+        try:
+            existing_shm = shared_memory.SharedMemory(name=shared_image_name)
+            image = np.ndarray(image_shape, dtype=image_dtype, buffer=existing_shm.buf)
+        except FileNotFoundError:
+            return  # Shared memory not available, exit worker
+
+        def is_homogeneous(node):
+            """Local version of homogeneity check using shared image."""
+            x, y, size = node
+            block = image[y:y+size, x:x+size]
+            return split_function(block)
+
+        while True:
+            # Get task from shared stack with lock
+            with task_lock:
+                if len(shared_task_stack) == 0:
+                    break
+                node = shared_task_stack.pop()
+
+            # Process the node
+            if node[2] > min_block_size and not is_homogeneous(node):
+                # Split the node
+                children = split(node)
+                # Store in shared quadtree (no lock needed as each worker uses different keys)
+                shared_quadtree[node] = children
+
+                # Add children to task stack with lock
+                with task_lock:
+                    for child in children:
+                        shared_task_stack.append(child)
+            else:
+                # Add to split result with lock
+                with result_lock:
+                    shared_split_result.append(node)
+
+        # Clean up shared memory reference
+        existing_shm.close()
 
     def _is_homogeneous(self, node: Tuple[int, int, int]) -> bool:
         """Checks if a block of the image is homogeneous using the split function.
@@ -73,25 +175,49 @@ class SequentialSplitAndMerge:
         return self.merging_function(weighted_means1, weighted_means2)
 
     def build_quadtree(self):
-        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
+        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks using parallel processing.
         The quadtree is built by checking if a block is homogeneous using the split function.
         If a block is not homogeneous, it is split into four children blocks.
         The process continues until all blocks are homogeneous or the minimum block size is reached.
         """
-        print("Building quadtree...")
-        task_stack = deque()
+        # Initialize the root node and shared task stack
         self.root = (0, 0, self.image.shape[0])
-        task_stack.append(self.root)
-        while len(task_stack) != 0:
-            node = task_stack.pop()
-            if node[2] > self.min_block_size and not self._is_homogeneous(node):
-                children = split(node)
-                self.quadtree[node] = children
-                for child in children:
-                    task_stack.append(child)
-            else:
-                self.split_result.append(node)
-        print("Quadtree built successfully.")
+        self.shared_task_stack.append(self.root)
+
+        # Clear previous results
+        self.shared_split_result[:] = []
+        self.shared_quadtree.clear()
+
+        # Create and start worker processes
+        processes = []
+        print("Starting worker processes...")
+        for _ in range(self.num_workers):
+            p = mp.Process(
+                target=self._worker_process,
+                args=(
+                    self.shared_image.name,
+                    self.image_shape,
+                    self.image_dtype,
+                    self.shared_task_stack,
+                    self.shared_split_result,
+                    self.shared_quadtree,
+                    self.task_lock,
+                    self.result_lock,
+                    self.split_function,
+                    self.min_block_size
+                )
+            )
+            p.start()
+            processes.append(p)
+        print(f"Started {len(processes)} worker processes.")
+        # Wait for all workers to complete
+        for p in processes:
+            p.join()
+
+        # Copy results back to instance variables
+        self.quadtree = dict(self.shared_quadtree)
+        self.split_result = list(self.shared_split_result)
+        print("Finished building quadtree with {} blocks.".format(len(self.split_result)))
         return
 
     def build_region_adjacency_graph(self):
@@ -100,7 +226,6 @@ class SequentialSplitAndMerge:
         Each node in the graph represents a block of the image, and edges represent adjacency between blocks.
         The graph is built by checking if two blocks are contiguous using the are_contiguous function, or by knowing it from their parent.
         """
-        print("Building region adjacency graph...")
         task_stack = deque()
         task_stack.append(self.root)
         self.graph_edges[self.root] = []
@@ -125,7 +250,6 @@ class SequentialSplitAndMerge:
                 self.graph_nodes.append([node])
         del self.quadtree
         gc.collect()
-        print("Region adjacency graph built successfully.")
         return
 
     def _merge_nodes(
@@ -163,7 +287,6 @@ class SequentialSplitAndMerge:
     def merge(self):
         """Iteratively merges similar regions in the graph until no more merges can be performed.
         The merging is done by checking if two contiguous graph nodes are similar."""
-        print("Merging regions...")
         queue = Queue()
         for graph_node in self.graph_nodes:
             queue.put(graph_node)
@@ -176,7 +299,6 @@ class SequentialSplitAndMerge:
                         new_graph_node = self._merge_nodes(graph_node, neighbour)
                         queue.put(new_graph_node)
                         break
-        print("Regions merged successfully.")
         return
 
     def get_split_image(self):

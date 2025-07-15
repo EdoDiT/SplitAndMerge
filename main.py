@@ -3,7 +3,18 @@ import time
 import cv2
 import numpy as np
 
+from Parallel.shm_workers import ParallelSplitAndMerge
 from Sequential.split_and_merge import SequentialSplitAndMerge
+
+def split_function(block):
+    return np.std(block) < 5
+
+def merging_function(mean1, mean2):
+    return np.abs(mean1 - mean2) < 15
+
+def merge_mean(block):
+    return np.mean(block)
+
 
 # Load the image
 loop_number = 1
@@ -16,10 +27,11 @@ start_time = time.time()
 for i in range(loop_number):
     split_and_merger = SequentialSplitAndMerge(
         image=image,
-        split_function=lambda block: np.std(block) < 5,  # Example threshold for homogeneity
-        merging_function=lambda mean1, mean2: np.abs(mean1 - mean2) < 15,  # Example threshold for merging
-        merge_mean=lambda block: np.mean(block),  # Mean function for merging
-        min_block_size=10  # Minimum size of blocks to consider
+        split_function=split_function,  # Example threshold for homogeneity
+        merging_function=merging_function,  # Example threshold for merging
+        merge_mean=merge_mean,  # Mean function for merging
+        min_block_size=10,  # Minimum size of blocks to consider
+        # num_workers=2  # Number of parallel workers
     )
     img_1, img_2 = split_and_merger.process_image()
 end_time = time.time()
