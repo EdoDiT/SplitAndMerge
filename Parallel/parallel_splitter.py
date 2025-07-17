@@ -1,7 +1,10 @@
 import gc
+import multiprocessing as mp
 from collections import deque
-from typing import Callable, Tuple, List, Any
+from logging import warning
+from multiprocessing import shared_memory
 from queue import Queue
+from typing import Callable, Tuple, List, Any
 
 import numpy as np
 from numpy import ndarray
@@ -9,7 +12,7 @@ from numpy import ndarray
 from utils.utility_functions import are_contiguous
 
 
-class SequentialSplitAndMerge:
+class ParallelSplit:
     """A class to perform sequential split and merge on an image.
     This class builds a quadtree from the image, constructs a region adjacency graph,
     and merges regions based on specified functions for splitting and merging.
@@ -21,78 +24,191 @@ class SequentialSplitAndMerge:
             min_block_size: int,
             merging_function: Callable,
             merge_mean: Callable = np.mean,
+            num_workers: int = None,
     ) -> None:
         """        Initializes the SequentialSplitAndMerge class.
         Args:
             image (ndarray): The input image to be processed.
             split_function (Callable): Function to determine if a block is homogeneous.
-            merging_function (Callable): Function to determine if two blocks can be merged.
-            merge_mean (Callable): Function to compute the mean of a block for merging.
             min_block_size (int): Minimum size of blocks to consider for splitting.
+            num_workers (int): Number of worker processes for parallel processing. If None, uses CPU count.
         """
         self.split_function = split_function
         self.merging_function = merging_function
         self.merge_mean = merge_mean
         self.image = image
-        self.split_image = image.copy()  # Initialize with the original image
-        self.merge_image = image.copy()  # Initialize with the original image
+        self.split_image = image.copy()
+        self.merge_image = image.copy() # Initialize with the original image
         self.root = None
         self.quadtree = dict()
-        self.graph_nodes = [] # A single node is a list of tuples, where each tuple represents a block of the image
-        self.graph_edges = dict() # The first tuple of a node is used as primary key for the edges. The table is symmetric. Each entry contains the full tuple list of all the neighbours
+        self.graph_nodes = []  # A single node is a list of tuples, where each tuple represents a block of the image
+        self.graph_edges = dict()  # The first tuple of a node is used as primary key for the edges. The table is symmetric. Each entry contains the full tuple list of all the neighbours
         self.min_block_size = min_block_size
         self.split_result = []
 
-    def _is_homogeneous(self, node: Tuple[int, int, int, Any, int]) -> bool:
-        """Checks if a block of the image is homogeneous using the split function.
-        Args:
-            node (Tuple[int, int, int, Any, int]): A tuple representing the block (x, y, size, merge_mean, area).
-        Returns:
-            bool: True if the block is homogeneous, False otherwise.
-        """
-        x, y, size, mean, area = node
-        block = self.image[y:y+size, x:x+size]
-        return self.split_function(block)
+        # Parallel processing setup
+        self.num_workers = num_workers if num_workers is not None else mp.cpu_count()
+        self.shared_image = None
+        self.image_shape = image.shape
+        self.image_dtype = image.dtype
+        print("Starting Parallel setup")
+        # Create shared memory for the image
+        self._setup_shared_memory()
 
-    def _split(self, node: Tuple[int, int, int, Any, int]) -> [
-        Tuple[int, int, int, Any, int], Tuple[int, int, int, Any, int], Tuple[int, int, int, Any, int],
+        # Multiprocessing synchronization primitives
+        self.manager = mp.Manager()
+        self.shared_task_stack = self.manager.list()
+        self.shared_split_result = self.manager.list()
+        self.shared_quadtree = self.manager.dict()
+        self.task_lock = mp.Lock()
+        self.result_lock = mp.Lock()
+        print("Parallel setup complete")
+
+    def _setup_shared_memory(self):
+        """Sets up shared memory for the image data."""
+        # Create shared memory buffer for the image
+        image_bytes = self.image.nbytes
+        self.shared_image = shared_memory.SharedMemory(create=True, size=image_bytes)
+
+        # Create numpy array from shared memory
+        shared_array = np.ndarray(self.image_shape, dtype=self.image_dtype, buffer=self.shared_image.buf)
+        shared_array[:] = self.image[:]
+
+    def _cleanup_shared_memory(self):
+        """Cleans up shared memory resources."""
+        if self.shared_image is not None:
+            self.shared_image.close()
+            self.shared_image.unlink()
+
+    def __del__(self):
+        """Destructor to clean up shared memory."""
+        try:
+            self._cleanup_shared_memory()
+        except Exception as e:
+            warning("Error during cleanup of shared memory: {}".format(e))
+            pass
+
+    @staticmethod
+    def is_homogeneous(node: Tuple[int, int, int, Any, int], image: ndarray, split_function: Callable) -> bool:
+        """Local version of homogeneity check using shared image."""
+        x, y, size, mean, area = node
+        block = image[y:y + size, x:x + size]
+        return split_function(block)
+
+    @staticmethod
+    def _split(
+            node: Tuple[int, int, int, Any, int],
+            image: ndarray,
+            merge_mean: Callable
+    ) -> List[
         Tuple[int, int, int, Any, int]
     ]:
         """Splits a node into four quadrants. node is a tuple of (x, y, size, mean, area)"""
         size = node[2] / 2
-        area = size * size
-        node_top_left = (
-        node[0], node[1], int(size), self.merge_mean(self.image[node[1]:int(node[1] + size), node[0]:int(node[0] + size)]), area)
-        node_top_right = (int(node[0] + size), node[1], int(size),
-                          self.merge_mean(self.image[node[1]:int(node[1] + size), int(node[0] + size):node[0] + node[2]]), area)
-        node_bottom_right = (int(node[0] + size), int(node[1] + size), int(size), self.merge_mean(
-            self.image[int(node[1] + size):node[1] + node[2], int(node[0] + size):node[0] + node[2]]), area)
-        node_bottom_left = (node[0], int(node[1] + size), int(size),
-                            self.merge_mean(self.image[int(node[1] + size):node[1] + node[2], node[0]:node[0] + int(size)]), area)
+        area = int(size * size)
+        node_top_left = (node[0], node[1], int(size), merge_mean(image[node[1]:int(node[1] + size), node[0]:int(node[0] + size)]), area)
+        node_top_right = (int(node[0] + size), node[1], int(size), merge_mean(image[node[1]:int(node[1] + size), int(node[0] + size):node[0] + node[2]]), area)
+        node_bottom_right = (int(node[0] + size), int(node[1] + size), int(size), merge_mean(image[int(node[1] + size):node[1] + node[2], int(node[0] + size):node[0] + node[2]]), area)
+        node_bottom_left = (node[0], int(node[1] + size), int(size), merge_mean(image[int(node[1] + size):node[1] + node[2], node[0]:node[0] + int(size)]), area)
         return [node_top_left, node_top_right, node_bottom_right, node_bottom_left]
 
+    @staticmethod
+    def _worker_process(shared_image_name, image_shape, image_dtype, shared_task_stack,
+                       shared_split_result, shared_quadtree, task_lock, result_lock,
+                       split_function, min_block_size, merge_mean):
+        """Worker process function for parallel quadtree building.
+
+        Args:
+            shared_image_name: Name of the shared memory block containing the image
+            image_shape: Shape of the image
+            image_dtype: Data type of the image
+            shared_task_stack: Shared task stack (managed list)
+            shared_split_result: Shared split result list (managed list)
+            shared_quadtree: Shared quadtree dictionary (managed dict)
+            task_lock: Lock for task stack access
+            result_lock: Lock for result list access
+            split_function: Function to determine if a block is homogeneous
+            min_block_size: Minimum block size for splitting
+        """
+        # Connect to shared memory
+        try:
+            existing_shm = shared_memory.SharedMemory(name=shared_image_name)
+            image = np.ndarray(image_shape, dtype=image_dtype, buffer=existing_shm.buf)
+        except FileNotFoundError:
+            return  # Shared memory not available, exit worker
+
+        while True:
+            # Get task from shared stack with lock
+            with task_lock:
+                if len(shared_task_stack) == 0:
+                    break
+                node = shared_task_stack.pop()
+
+            # Process the node
+            if node[2] > min_block_size and not ParallelSplit.is_homogeneous(node, image, split_function):
+                # Split the node
+                children = ParallelSplit._split(node, image, merge_mean)
+                # Store in shared quadtree (no lock needed as each worker uses different keys)
+                shared_quadtree[node] = children
+
+                # Add children to task stack with lock
+                with task_lock:
+                    for child in children:
+                        shared_task_stack.append(child)
+            else:
+                # Add to split result with lock
+                with result_lock:
+                    shared_split_result.append(node)
+
+        # Clean up shared memory reference
+        existing_shm.close()
+
     def build_quadtree(self):
-        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks.
+        """Builds a quadtree from the image by recursively splitting it into homogeneous blocks using parallel processing.
         The quadtree is built by checking if a block is homogeneous using the split function.
         If a block is not homogeneous, it is split into four children blocks.
         The process continues until all blocks are homogeneous or the minimum block size is reached.
         """
-        self.split_result = []
-        print("Building quadtree...")
-        task_stack = deque()
-        size = self.image.shape[0]
+        # Initialize the root node and shared task stack
+        size = size = self.image.shape[0]
         self.root = (0, 0, size, self.merge_mean(self.image), size*size)  # (x, y, size, mean, area)
-        task_stack.append(self.root)
-        while len(task_stack) != 0:
-            node = task_stack.pop()
-            if node[2] > self.min_block_size and not self._is_homogeneous(node):
-                children = self._split(node)
-                self.quadtree[node] = children
-                for child in children:
-                    task_stack.append(child)
-            else:
-                self.split_result.append(node)
-        print("Quadtree built successfully.")
+        self.shared_task_stack.append(self.root)
+
+        # Clear previous results
+        self.shared_split_result[:] = []
+        self.shared_quadtree.clear()
+
+        # Create and start worker processes
+        processes = []
+        print("Starting worker processes...")
+        for _ in range(self.num_workers):
+            p = mp.Process(
+                target=self._worker_process,
+                args=(
+                    self.shared_image.name,
+                    self.image_shape,
+                    self.image_dtype,
+                    self.shared_task_stack,
+                    self.shared_split_result,
+                    self.shared_quadtree,
+                    self.task_lock,
+                    self.result_lock,
+                    self.split_function,
+                    self.min_block_size,
+                    self.merge_mean
+                )
+            )
+            p.start()
+            processes.append(p)
+        print(f"Started {len(processes)} worker processes.")
+        # Wait for all workers to complete
+        for p in processes:
+            p.join()
+
+        # Copy results back to instance variables
+        self.quadtree = dict(self.shared_quadtree)
+        self.split_result = list(self.shared_split_result)
+        print("Finished building quadtree with {} blocks.".format(len(self.split_result)))
         return
 
     def _are_similar(self, region1: tuple, region2: tuple) -> bool:
