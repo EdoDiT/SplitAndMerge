@@ -3,7 +3,8 @@ import time
 import cv2
 import numpy as np
 
-from Parallel.shm_workers import ParallelSplitAndMerge
+from Parallel.parallel_splitter import ParallelSplit
+from Parallel.parallel_merger import ParallelSplitAndMerge
 from Sequential.split_and_merge import SequentialSplitAndMerge
 
 def split_function(block):
@@ -25,7 +26,7 @@ if image is None:
 gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 start_time = time.time()
 for i in range(loop_number):
-    split_and_merger = SequentialSplitAndMerge(
+    split_and_merger = ParallelSplitAndMerge(
         image=image,
         split_function=split_function,  # Example threshold for homogeneity
         merging_function=merging_function,  # Example threshold for merging
