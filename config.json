@@ -1,0 +1,15 @@
+{
+  "splitter": {
+    "type": "dict_parallel_splitter",
+    "kwargs": {
+      "min_block_size": 10
+    }
+  },
+  "merger": {
+    "type": "dict_graph_parallel_merger",
+    "kwargs": {
+    }
+  },
+  "image": "imgs_lab/sample_image.png",
+  "loop_count": 5
+}
