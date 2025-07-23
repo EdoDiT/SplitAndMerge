@@ -52,7 +52,6 @@ class QuadNodeSequentialSplitter(Splitter):
         """Converts the quadtree into the dictionary form for compatibility with mergers."""
         task_stack = deque()
         self.quadtree = {}
-        self.root = QuadNode(x=0, y=0, size_x=self._image.shape[0], size_y=self._image.shape[1], image=self._image)
         task_stack.append(self.root)
         while len(task_stack) != 0:
             node = task_stack.pop()
